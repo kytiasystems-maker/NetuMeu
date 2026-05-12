@@ -1,104 +1,64 @@
 import axios from 'axios'
-import { exec } from 'child_process'
-import { writeFileSync, readFileSync, unlinkSync, existsSync } from 'fs'
-import { randomUUID } from 'crypto'
-import path from 'path'
 
-// ─── Transcriere audio ───
-// Strategie: 
-//   1. Convertim OGG (format WhatsApp) în WAV cu ffmpeg
-//   2. Trimitem la Google Speech-to-Text (gratuit 60 min/lună)
-//   3. Dacă Google nu merge, facem fallback pe Whisper (când vrei upgrade)
+// ═══════════════════════════════════════════════
+// Transcriere audio — Google Speech-to-Text
+// Trimite OGG_OPUS direct (formatul nativ WhatsApp)
+// NU mai necesită ffmpeg!
+// Free tier: 60 minute/lună gratuit
+// ═══════════════════════════════════════════════
 
 export async function transcribeAudio(audioBuffer, mimeType = 'audio/ogg') {
-  const id = randomUUID()
-  const inputPath = `/tmp/netumeu_${id}.ogg`
-  const wavPath = `/tmp/netumeu_${id}.wav`
+  const audioBase64 = audioBuffer.toString('base64')
 
-  try {
-    // Salvează audio-ul brut
-    writeFileSync(inputPath, audioBuffer)
-
-    // Convertim în WAV 16kHz mono (necesar pentru Speech-to-Text)
-    await convertToWav(inputPath, wavPath)
-
-    // Citim WAV-ul convertit
-    const wavBuffer = readFileSync(wavPath)
-    const audioBase64 = wavBuffer.toString('base64')
-
-    // Încercare 1: Google Speech-to-Text (gratuit, 60 min/lună)
-    try {
-      const transcript = await googleSpeechToText(audioBase64)
-      if (transcript && transcript.length > 2) return transcript
-    } catch (err) {
-      console.warn('⚠️ Google STT eșuat:', err.message)
-    }
-
-    // Fallback: returnează mesaj de eroare
-    console.warn('⚠️ Transcriere eșuată — returnez fallback')
-    return '[Transcriere audio eșuată — contabilul va primi fișierul audio original]'
-
-  } finally {
-    // Cleanup
-    try { if (existsSync(inputPath)) unlinkSync(inputPath) } catch {}
-    try { if (existsSync(wavPath)) unlinkSync(wavPath) } catch {}
-  }
-}
-
-// ─── Conversie OGG → WAV cu ffmpeg ───
-function convertToWav(inputPath, outputPath) {
-  return new Promise((resolve, reject) => {
-    const cmd = `ffmpeg -i ${inputPath} -ar 16000 -ac 1 -f wav ${outputPath} -y 2>/dev/null`
-    exec(cmd, (err) => {
-      if (err) reject(new Error('ffmpeg conversie eșuată: ' + err.message))
-      else resolve()
-    })
-  })
-}
-
-// ─── Google Speech-to-Text (free tier: 60 min/lună) ───
-// Folosește REST API fără API key (limitat dar gratuit)
-// Pentru producție: activează Cloud Speech API + API key
-async function googleSpeechToText(audioBase64) {
-  // Notă: Varianta gratuită fără API key nu există oficial.
-  // Trebuie un API key de la Google Cloud (free tier = 60 min/lună).
-  // Dacă nu ai setat GOOGLE_SPEECH_API_KEY, folosim fallback.
-
+  // Google Speech-to-Text (gratuit 60 min/lună)
   const apiKey = process.env.GOOGLE_SPEECH_API_KEY
   if (!apiKey) {
-    throw new Error('GOOGLE_SPEECH_API_KEY nu e setat — folosește fallback')
+    console.warn('⚠️ GOOGLE_SPEECH_API_KEY nu e setat')
+    return '[Transcriere indisponibilă — lipsește API key]'
   }
 
-  const res = await axios.post(
-    `https://speech.googleapis.com/v1/speech:recognize?key=${apiKey}`,
-    {
-      config: {
-        encoding: 'LINEAR16',
-        sampleRateHertz: 16000,
-        languageCode: 'ro-RO',
-        model: 'default',
-        enableAutomaticPunctuation: true,
+  try {
+    const res = await axios.post(
+      `https://speech.googleapis.com/v1/speech:recognize?key=${apiKey}`,
+      {
+        config: {
+          encoding: 'OGG_OPUS',
+          sampleRateHertz: 16000,
+          languageCode: 'ro-RO',
+          enableAutomaticPunctuation: true,
+          model: 'default',
+        },
+        audio: {
+          content: audioBase64
+        }
       },
-      audio: {
-        content: audioBase64
-      }
-    },
-    { timeout: 30000 }
-  )
+      { timeout: 30000 }
+    )
 
-  const results = res.data.results
-  if (!results || results.length === 0) return ''
+    const results = res.data.results
+    if (!results || results.length === 0) {
+      console.warn('⚠️ Google STT: niciun rezultat returnat')
+      return '[Nu s-a putut transcrie — audio prea scurt sau neclar]'
+    }
 
-  return results.map(r => r.alternatives[0].transcript).join(' ')
+    const transcript = results.map(r => r.alternatives[0].transcript).join(' ')
+    console.log(`✅ Transcris: "${transcript}"`)
+    return transcript
+
+  } catch (err) {
+    const errMsg = err.response?.data?.error?.message || err.message
+    console.error('❌ Google STT eroare:', errMsg)
+    return `[Eroare transcriere: ${errMsg}]`
+  }
 }
 
 // ═══════════════════════════════════════════════
-// UPGRADE PATH: Whisper API (când vrei calitate maximă)
-// Decomentează funcția de mai jos și setează OPENAI_API_KEY
-// Cost: ~$0.006/minut = ~3 lei/oră
+// UPGRADE: Whisper API (calitate superioară)
+// Decomentează și setează OPENAI_API_KEY
+// Cost: ~$0.006/min
 // ═══════════════════════════════════════════════
 //
-// async function whisperTranscribe(audioBuffer) {
+// export async function transcribeAudio(audioBuffer, mimeType = 'audio/ogg') {
 //   const FormData = (await import('form-data')).default
 //   const form = new FormData()
 //   form.append('file', audioBuffer, { filename: 'audio.ogg', contentType: 'audio/ogg' })
